@@ -9,12 +9,20 @@
 (define-constant ERR_DROP_NOT_ACTIVE (err u107))
 (define-constant ERR_INVALID_DURATION (err u108))
 (define-constant ERR_TOKEN_TRANSFER_FAILED (err u109))
+(define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u110))
+(define-constant ERR_SEASON_NOT_ACTIVE (err u111))
+(define-constant ERR_INVALID_SEASON (err u112))
+(define-constant ERR_ALREADY_CLAIMED_REWARD (err u113))
 
 (define-non-fungible-token locdrop-nft uint)
 
 (define-data-var next-drop-id uint u1)
 (define-data-var next-token-id uint u1)
 (define-data-var contract-paused bool false)
+(define-data-var current-season uint u1)
+(define-data-var season-start-block uint u0)
+(define-data-var season-end-block uint u0)
+(define-data-var next-achievement-id uint u1)
 
 (define-map drops
   uint
@@ -56,6 +64,59 @@
 (define-map authorized-oracles
   principal
   bool
+)
+
+(define-map user-stats
+  principal
+  {
+    total-claims: uint,
+    total-drops-created: uint,
+    current-season-claims: uint,
+    current-season-points: uint,
+    total-points: uint,
+    achievements-unlocked: uint,
+    current-streak: uint,
+    best-streak: uint,
+    last-claim-block: uint
+  }
+)
+
+(define-map season-leaderboard
+  { season: uint, rank: uint }
+  { user: principal, points: uint }
+)
+
+(define-map user-season-ranks
+  { user: principal, season: uint }
+  { rank: uint, points: uint, rewards-claimed: bool }
+)
+
+(define-map achievements
+  uint
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    points-reward: uint,
+    requirement-type: (string-ascii 32),
+    requirement-value: uint,
+    is-active: bool
+  }
+)
+
+(define-map user-achievements
+  { user: principal, achievement-id: uint }
+  { unlocked: bool, unlock-block: uint }
+)
+
+(define-map season-info
+  uint
+  {
+    start-block: uint,
+    end-block: uint,
+    total-participants: uint,
+    total-claims: uint,
+    is-active: bool
+  }
 )
 
 (define-public (set-oracle-status (oracle principal) (authorized bool))
@@ -109,6 +170,7 @@
     
     (map-set drop-participants drop-id { participant-count: u0 })
     (var-set next-drop-id (+ drop-id u1))
+    ;; (try! (update-user-stats-for-drop-creation tx-sender))
     (ok drop-id)
   )
 )
@@ -176,6 +238,8 @@
       (merge drop-data { current-claims: (+ (get current-claims drop-data) u1) })
     )
     
+    ;; (try! (update-user-stats-for-claim tx-sender))
+    ;; (try! (check-and-unlock-achievements tx-sender))
     (var-set next-token-id (+ token-id u1))
     (ok token-id)
   )
@@ -277,6 +341,248 @@
       (< (get current-claims drop-data) (get max-claims drop-data))
       (is-none user-claim)
     ))
+    )
+    )
+
+(define-public (create-achievement 
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (points-reward uint)
+  (requirement-type (string-ascii 32))
+  (requirement-value uint))
+  (let
+    (
+      (achievement-id (var-get next-achievement-id))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> points-reward u0) ERR_INVALID_LOCATION)
+    (asserts! (> requirement-value u0) ERR_INVALID_LOCATION)
+    
+    (map-set achievements achievement-id {
+      name: name,
+      description: description,
+      points-reward: points-reward,
+      requirement-type: requirement-type,
+      requirement-value: requirement-value,
+      is-active: true
+    })
+    
+    (var-set next-achievement-id (+ achievement-id u1))
+    (ok achievement-id)
+  )
+)
+
+(define-public (start-new-season (duration uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (new-season (+ (var-get current-season) u1))
+      (end-block (+ current-block duration))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> duration u0) ERR_INVALID_DURATION)
+    
+    (map-set season-info (var-get current-season) {
+      start-block: (var-get season-start-block),
+      end-block: (var-get season-end-block),
+      total-participants: u0,
+      total-claims: u0,
+      is-active: false
+    })
+    
+    (var-set current-season new-season)
+    (var-set season-start-block current-block)
+    (var-set season-end-block end-block)
+    
+    (map-set season-info new-season {
+      start-block: current-block,
+      end-block: end-block,
+      total-participants: u0,
+      total-claims: u0,
+      is-active: true
+    })
+    
+    (ok new-season)
+  )
+)
+
+(define-private (update-user-stats-for-claim (user principal))
+  (let
+    (
+      (current-stats (default-to {
+        total-claims: u0,
+        total-drops-created: u0,
+        current-season-claims: u0,
+        current-season-points: u0,
+        total-points: u0,
+        achievements-unlocked: u0,
+        current-streak: u0,
+        best-streak: u0,
+        last-claim-block: u0
+      } (map-get? user-stats user)))
+      (current-block stacks-block-height)
+      (new-streak (if (< (- current-block (get last-claim-block current-stats)) u1000)
+        (+ (get current-streak current-stats) u1)
+        u1))
+      (base-points u10)
+      (streak-bonus (* new-streak u2))
+      (total-points (+ base-points streak-bonus))
+    )
+    (map-set user-stats user {
+      total-claims: (+ (get total-claims current-stats) u1),
+      total-drops-created: (get total-drops-created current-stats),
+      current-season-claims: (+ (get current-season-claims current-stats) u1),
+      current-season-points: (+ (get current-season-points current-stats) total-points),
+      total-points: (+ (get total-points current-stats) total-points),
+      achievements-unlocked: (get achievements-unlocked current-stats),
+      current-streak: new-streak,
+      best-streak: (if (> new-streak (get best-streak current-stats)) new-streak (get best-streak current-stats)),
+      last-claim-block: current-block
+    })
+    (ok true)
+  )
+)
+
+(define-private (update-user-stats-for-drop-creation (user principal))
+  (let
+    (
+      (current-stats (default-to {
+        total-claims: u0,
+        total-drops-created: u0,
+        current-season-claims: u0,
+        current-season-points: u0,
+        total-points: u0,
+        achievements-unlocked: u0,
+        current-streak: u0,
+        best-streak: u0,
+        last-claim-block: u0
+      } (map-get? user-stats user)))
+      (creation-points u25)
+    )
+    (map-set user-stats user {
+      total-claims: (get total-claims current-stats),
+      total-drops-created: (+ (get total-drops-created current-stats) u1),
+      current-season-claims: (get current-season-claims current-stats),
+      current-season-points: (+ (get current-season-points current-stats) creation-points),
+      total-points: (+ (get total-points current-stats) creation-points),
+      achievements-unlocked: (get achievements-unlocked current-stats),
+      current-streak: (get current-streak current-stats),
+      best-streak: (get best-streak current-stats),
+      last-claim-block: (get last-claim-block current-stats)
+    })
+    (ok true)
+  )
+)
+
+(define-private (check-and-unlock-achievements (user principal))
+  (let
+    (
+      (user-stats-data (unwrap! (map-get? user-stats user) (ok false)))
+    )
+    ;; (try! (check-achievement user u1 "total-claims" (get total-claims user-stats-data)))
+    ;; (try! (check-achievement user u2 "current-streak" (get current-streak user-stats-data)))
+    ;; (try! (check-achievement user u3 "total-drops-created" (get total-drops-created user-stats-data)))
+    ;; (try! (check-achievement user u4 "total-points" (get total-points user-stats-data)))
+    (ok true)
+  )
+)
+
+(define-private (check-achievement (user principal) (achievement-id uint) (stat-type (string-ascii 32)) (stat-value uint))
+  (let
+    (
+      (achievement-data (unwrap! (map-get? achievements achievement-id) (ok false)))
+      (user-achievement (map-get? user-achievements { user: user, achievement-id: achievement-id }))
+    )
+    (if (and 
+      (get is-active achievement-data)
+      (is-eq (get requirement-type achievement-data) stat-type)
+      (>= stat-value (get requirement-value achievement-data))
+      (is-none user-achievement))
+      (begin
+        (map-set user-achievements 
+          { user: user, achievement-id: achievement-id }
+          { unlocked: true, unlock-block: stacks-block-height })
+        ;; (try! (award-achievement-points user (get points-reward achievement-data)))
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-private (award-achievement-points (user principal) (points uint))
+  (let
+    (
+      (current-stats (unwrap! (map-get? user-stats user) (ok false)))
+    )
+    (map-set user-stats user 
+      (merge current-stats {
+        achievements-unlocked: (+ (get achievements-unlocked current-stats) u1),
+        current-season-points: (+ (get current-season-points current-stats) points),
+        total-points: (+ (get total-points current-stats) points)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-season-reward (season uint))
+  (let
+    (
+      (user-rank (unwrap! (map-get? user-season-ranks { user: tx-sender, season: season }) ERR_INVALID_SEASON))
+      (season-data (unwrap! (map-get? season-info season) ERR_INVALID_SEASON))
+    )
+    (asserts! (not (get is-active season-data)) ERR_SEASON_NOT_ACTIVE)
+    (asserts! (not (get rewards-claimed user-rank)) ERR_ALREADY_CLAIMED_REWARD)
+    
+    (map-set user-season-ranks 
+      { user: tx-sender, season: season }
+      (merge user-rank { rewards-claimed: true })
+    )
+    
+    (ok (get rank user-rank))
+  )
+)
+
+(define-read-only (get-user-stats (user principal))
+  (map-get? user-stats user)
+)
+
+(define-read-only (get-user-achievements (user principal))
+  (ok (filter check-user-achievement-unlocked (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+)
+
+(define-read-only (get-achievement (achievement-id uint))
+  (map-get? achievements achievement-id)
+)
+
+(define-read-only (get-season-leaderboard (season uint) (limit uint))
+  (ok (map get-leaderboard-entry (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+)
+
+(define-read-only (get-current-season)
+  (var-get current-season)
+)
+
+(define-read-only (get-season-info (season uint))
+  (map-get? season-info season)
+)
+
+(define-read-only (get-user-season-rank (user principal) (season uint))
+  (map-get? user-season-ranks { user: user, season: season })
+)
+
+(define-private (check-user-achievement-unlocked (achievement-id uint))
+  (match (map-get? user-achievements { user: tx-sender, achievement-id: achievement-id })
+    achievement-data (get unlocked achievement-data)
+    false
+  )
+)
+
+(define-private (get-leaderboard-entry (rank uint))
+  (match (map-get? season-leaderboard { season: (var-get current-season), rank: rank })
+    leaderboard-entry { user: (get user leaderboard-entry), points: (get points leaderboard-entry) }
+    { user: tx-sender, points: u0 }
   )
 )
 
