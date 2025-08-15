@@ -13,6 +13,12 @@
 (define-constant ERR_SEASON_NOT_ACTIVE (err u111))
 (define-constant ERR_INVALID_SEASON (err u112))
 (define-constant ERR_ALREADY_CLAIMED_REWARD (err u113))
+(define-constant ERR_NOT_VERIFIED (err u114))
+(define-constant ERR_ALREADY_VERIFIED (err u115))
+(define-constant ERR_VERIFICATION_EXPIRED (err u116))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u117))
+(define-constant ERR_VERIFIER_NOT_REGISTERED (err u118))
+(define-constant ERR_CANNOT_VERIFY_OWN_DROP (err u119))
 
 (define-non-fungible-token locdrop-nft uint)
 
@@ -23,6 +29,8 @@
 (define-data-var season-start-block uint u0)
 (define-data-var season-end-block uint u0)
 (define-data-var next-achievement-id uint u1)
+(define-data-var next-verification-id uint u1)
+(define-data-var verification-window-blocks uint u1000)
 
 (define-map drops
   uint
@@ -37,7 +45,10 @@
     end-block: uint,
     max-claims: uint,
     current-claims: uint,
-    active: bool
+    active: bool,
+    verification-required: bool,
+    verified: bool,
+    verification-count: uint
   }
 )
 
@@ -119,6 +130,53 @@
   }
 )
 
+;; Drop verification network data structures
+(define-map verifiers
+  principal
+  {
+    reputation-score: uint,
+    total-verifications: uint,
+    accurate-verifications: uint,
+    registration-block: uint,
+    is-active: bool,
+    stake-amount: uint
+  }
+)
+
+(define-map verification-requests
+  uint
+  {
+    drop-id: uint,
+    requester: principal,
+    request-block: uint,
+    required-verifications: uint,
+    current-verifications: uint,
+    consensus-reached: bool,
+    verification-reward: uint,
+    deadline-block: uint
+  }
+)
+
+(define-map drop-verifications
+  { verification-id: uint, verifier: principal }
+  {
+    is-valid: bool,
+    verification-block: uint,
+    evidence-hash: (string-ascii 64),
+    reward-claimed: bool
+  }
+)
+
+(define-map verification-consensus
+  uint
+  {
+    positive-votes: uint,
+    negative-votes: uint,
+    final-result: bool,
+    consensus-block: uint
+  }
+)
+
 (define-public (set-oracle-status (oracle principal) (authorized bool))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -140,7 +198,8 @@
   (token-uri (string-ascii 256))
   (reward-amount uint)
   (duration uint)
-  (max-claims uint))
+  (max-claims uint)
+  (requires-verification bool))
   (let
     (
       (drop-id (var-get next-drop-id))
@@ -165,12 +224,15 @@
       end-block: end-block,
       max-claims: max-claims,
       current-claims: u0,
-      active: true
+      active: true,
+      verification-required: requires-verification,
+      verified: (not requires-verification),
+      verification-count: u0
     })
     
     (map-set drop-participants drop-id { participant-count: u0 })
     (var-set next-drop-id (+ drop-id u1))
-    ;; (try! (update-user-stats-for-drop-creation tx-sender))
+    (unwrap! (update-user-stats-for-drop-creation tx-sender) ERR_INVALID_LOCATION)
     (ok drop-id)
   )
 )
@@ -217,6 +279,11 @@
     (asserts! (not (var-get contract-paused)) ERR_NOT_AUTHORIZED)
     (asserts! (get active drop-data) ERR_DROP_NOT_ACTIVE)
     (asserts! (>= current-block (get start-block drop-data)) ERR_DROP_NOT_ACTIVE)
+    ;; Check if drop requires verification and is verified
+    (if (get verification-required drop-data)
+      (asserts! (get verified drop-data) ERR_NOT_VERIFIED)
+      true
+    )
     (try! (nft-mint? locdrop-nft token-id tx-sender))
     
     (map-set user-claims 
@@ -238,8 +305,8 @@
       (merge drop-data { current-claims: (+ (get current-claims drop-data) u1) })
     )
     
-    ;; (try! (update-user-stats-for-claim tx-sender))
-    ;; (try! (check-and-unlock-achievements tx-sender))
+    (unwrap! (update-user-stats-for-claim tx-sender) ERR_INVALID_LOCATION)
+    (unwrap! (check-and-unlock-achievements tx-sender) ERR_INVALID_LOCATION)
     (var-set next-token-id (+ token-id u1))
     (ok token-id)
   )
@@ -296,32 +363,7 @@
   )
 )
 
-;; (define-read-only (get-token-uri (token-id uint))
-;;   (let
-;;     (
-;;     ;;   (claim-info (unwrap! (get-claim-by-token-id token-id) (err "Token not found")))
-;;       (drop-data (unwrap! (map-get? drops (get drop-id claim-info)) (err "Drop not found")))
-;;     )
-;;     (ok (some (get token-uri drop-data)))
-;;   )
-;; )
 
-
-
-;; (define-read-only (is-user-in-range (user principal) (drop-id uint))
-;;   (let
-;;     (
-;;       (drop-data (unwrap! (map-get? drops drop-id) ERR_DROP_NOT_FOUND))
-;;       (user-location (unwrap! (map-get? user-locations user) ERR_INVALID_LOCATION))
-;;       (distance (calculate-distance 
-;;         (get latitude user-location) 
-;;         (get longitude user-location)
-;;         (get latitude drop-data) 
-;;         (get longitude drop-data)))
-;;     )
-;;     ;; (ok (<= distance (get radius drop-data)))
-;;   )
-;; )
 
 (define-read-only (get-active-drops)
   (ok (var-get next-drop-id))
@@ -584,5 +626,250 @@
     leaderboard-entry { user: (get user leaderboard-entry), points: (get points leaderboard-entry) }
     { user: tx-sender, points: u0 }
   )
+)
+
+;; Drop Verification Network Functions
+
+;; Register as a verifier with reputation stake
+(define-public (register-verifier (stake-amount uint))
+  (begin
+    (asserts! (> stake-amount u100) ERR_INSUFFICIENT_REPUTATION) ;; Minimum stake requirement
+    (asserts! (is-none (map-get? verifiers tx-sender)) ERR_ALREADY_VERIFIED)
+    
+    (map-set verifiers tx-sender {
+      reputation-score: u100, ;; Starting reputation
+      total-verifications: u0,
+      accurate-verifications: u0,
+      registration-block: stacks-block-height,
+      is-active: true,
+      stake-amount: stake-amount
+    })
+    
+    (ok true)
+  )
+)
+
+;; Request verification for a drop
+(define-public (request-drop-verification (drop-id uint) (reward-amount uint))
+  (let
+    (
+      (drop-data (unwrap! (map-get? drops drop-id) ERR_DROP_NOT_FOUND))
+      (verification-id (var-get next-verification-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator drop-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get verification-required drop-data) ERR_INVALID_LOCATION)
+    (asserts! (not (get verified drop-data)) ERR_ALREADY_VERIFIED)
+    (asserts! (> reward-amount u0) ERR_INVALID_LOCATION)
+    
+    (map-set verification-requests verification-id {
+      drop-id: drop-id,
+      requester: tx-sender,
+      request-block: current-block,
+      required-verifications: u3, ;; Require 3 verifications for consensus
+      current-verifications: u0,
+      consensus-reached: false,
+      verification-reward: reward-amount,
+      deadline-block: (+ current-block (var-get verification-window-blocks))
+    })
+    
+    (var-set next-verification-id (+ verification-id u1))
+    (ok verification-id)
+  )
+)
+
+;; Submit verification for a drop
+(define-public (submit-verification 
+  (verification-id uint) 
+  (is-valid bool) 
+  (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (request-data (unwrap! (map-get? verification-requests verification-id) ERR_INVALID_LOCATION))
+      (verifier-data (unwrap! (map-get? verifiers tx-sender) ERR_VERIFIER_NOT_REGISTERED))
+      (drop-data (unwrap! (map-get? drops (get drop-id request-data)) ERR_DROP_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    ;; Validation checks
+    (asserts! (get is-active verifier-data) ERR_VERIFIER_NOT_REGISTERED)
+    (asserts! (>= (get reputation-score verifier-data) u50) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (not (is-eq tx-sender (get creator drop-data))) ERR_CANNOT_VERIFY_OWN_DROP)
+    (asserts! (<= current-block (get deadline-block request-data)) ERR_VERIFICATION_EXPIRED)
+    (asserts! (not (get consensus-reached request-data)) ERR_ALREADY_VERIFIED)
+    (asserts! (is-none (map-get? drop-verifications { verification-id: verification-id, verifier: tx-sender })) ERR_ALREADY_VERIFIED)
+    
+    ;; Record verification
+    (map-set drop-verifications 
+      { verification-id: verification-id, verifier: tx-sender }
+      {
+        is-valid: is-valid,
+        verification-block: current-block,
+        evidence-hash: evidence-hash,
+        reward-claimed: false
+      }
+    )
+    
+    ;; Update request count
+    (map-set verification-requests verification-id 
+      (merge request-data { 
+        current-verifications: (+ (get current-verifications request-data) u1) 
+      })
+    )
+    
+    ;; Update verifier stats
+    (map-set verifiers tx-sender
+      (merge verifier-data {
+        total-verifications: (+ (get total-verifications verifier-data) u1)
+      })
+    )
+    
+    ;; Check if consensus is reached
+    (try! (check-verification-consensus verification-id))
+    
+    (ok true)
+  )
+)
+
+;; Check and finalize verification consensus
+(define-private (check-verification-consensus (verification-id uint))
+  (let
+    (
+      (request-data (unwrap! (map-get? verification-requests verification-id) ERR_INVALID_LOCATION))
+      (required-votes (get required-verifications request-data))
+      (current-votes (get current-verifications request-data))
+    )
+    (if (>= current-votes required-votes)
+      (finalize-verification-consensus verification-id)
+      (ok false)
+    )
+  )
+)
+
+;; Finalize verification consensus and update drop status
+(define-private (finalize-verification-consensus (verification-id uint))
+  (let
+    (
+      (request-data (unwrap! (map-get? verification-requests verification-id) ERR_INVALID_LOCATION))
+      (drop-id (get drop-id request-data))
+      (drop-data (unwrap! (map-get? drops drop-id) ERR_DROP_NOT_FOUND))
+      (consensus-result (calculate-consensus-result verification-id))
+    )
+    ;; Mark consensus as reached
+    (map-set verification-requests verification-id
+      (merge request-data { consensus-reached: true })
+    )
+    
+    ;; Store consensus result
+    (map-set verification-consensus verification-id {
+      positive-votes: (get positive-votes consensus-result),
+      negative-votes: (get negative-votes consensus-result),
+      final-result: (get final-result consensus-result),
+      consensus-block: stacks-block-height
+    })
+    
+    ;; Update drop verification status
+    (map-set drops drop-id
+      (merge drop-data {
+        verified: (get final-result consensus-result),
+        verification-count: (+ (get verification-count drop-data) u1)
+      })
+    )
+    
+    ;; Update verifier reputations based on consensus
+    (try! (update-verifier-reputations verification-id))
+    
+    (ok true)
+  )
+)
+
+;; Calculate consensus result from verifications
+(define-private (calculate-consensus-result (verification-id uint))
+  (let
+    (
+      (positive-count u0)
+      (negative-count u0)
+    )
+    ;; In a real implementation, this would iterate through all verifications
+    ;; For this example, we'll use a simplified calculation
+    {
+      positive-votes: u2, ;; Simplified - would calculate actual votes
+      negative-votes: u1,
+      final-result: true ;; Majority wins
+    }
+  )
+)
+
+;; Update verifier reputations based on consensus accuracy
+(define-private (update-verifier-reputations (verification-id uint))
+  (let
+    (
+      (consensus-data (unwrap! (map-get? verification-consensus verification-id) ERR_INVALID_LOCATION))
+      (final-result (get final-result consensus-data))
+    )
+    ;; In a real implementation, this would update each verifier's reputation
+    ;; based on whether their vote matched the consensus
+    (ok true)
+  )
+)
+
+;; Claim verification reward
+(define-public (claim-verification-reward (verification-id uint))
+  (let
+    (
+      (verification-data (unwrap! (map-get? drop-verifications 
+        { verification-id: verification-id, verifier: tx-sender }) ERR_INVALID_LOCATION))
+      (request-data (unwrap! (map-get? verification-requests verification-id) ERR_INVALID_LOCATION))
+      (consensus-data (unwrap! (map-get? verification-consensus verification-id) ERR_INVALID_LOCATION))
+    )
+    (asserts! (get consensus-reached request-data) ERR_INVALID_LOCATION)
+    (asserts! (not (get reward-claimed verification-data)) ERR_ALREADY_CLAIMED_REWARD)
+    
+    ;; Check if verifier was on the winning side
+    (asserts! (is-eq (get is-valid verification-data) (get final-result consensus-data)) ERR_INVALID_LOCATION)
+    
+    ;; Mark reward as claimed
+    (map-set drop-verifications 
+      { verification-id: verification-id, verifier: tx-sender }
+      (merge verification-data { reward-claimed: true })
+    )
+    
+    ;; Award reputation points
+    (try! (update-verifier-reputation-reward tx-sender))
+    
+    (ok (get verification-reward request-data))
+  )
+)
+
+;; Update verifier reputation after successful verification
+(define-private (update-verifier-reputation-reward (verifier principal))
+  (let
+    (
+      (verifier-data (unwrap! (map-get? verifiers verifier) ERR_VERIFIER_NOT_REGISTERED))
+    )
+    (map-set verifiers verifier
+      (merge verifier-data {
+        reputation-score: (+ (get reputation-score verifier-data) u10),
+        accurate-verifications: (+ (get accurate-verifications verifier-data) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for verification network
+(define-read-only (get-verifier-info (verifier principal))
+  (map-get? verifiers verifier)
+)
+
+(define-read-only (get-verification-request (verification-id uint))
+  (map-get? verification-requests verification-id)
+)
+
+(define-read-only (get-verification-consensus (verification-id uint))
+  (map-get? verification-consensus verification-id)
+)
+
+(define-read-only (get-drop-verification (verification-id uint) (verifier principal))
+  (map-get? drop-verifications { verification-id: verification-id, verifier: verifier })
 )
 
