@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Locdrop.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.drop-collaboration]
+path = 'contracts/drop-collaboration.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
